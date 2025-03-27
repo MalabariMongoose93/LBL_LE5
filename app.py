@@ -70,6 +70,14 @@ def process_company_stats(data_df):
     
     return stats
 
+def highlight_dissolved_rows(sheet, max_col):
+    """Highlight dissolved companies in a worksheet"""
+    red_fill = PatternFill(start_color='FFCCCB', end_color='FFCCCB', fill_type='solid')
+    for row in sheet.iter_rows(min_row=2, max_row=sheet.max_row, min_col=1, max_col=max_col):
+        if row[max_col - 1].value == 'Dissolved':
+            for cell in row:
+                cell.fill = red_fill
+
 def main():
     st.title("Company Data Processor")
     st.write("Upload a CSV file containing SIC codes to search for companies.")
@@ -89,6 +97,7 @@ def main():
             # Accumulated data
             all_data = pd.DataFrame()
             active_company_addresses = pd.DataFrame(columns=['company_name', 'registered_office_address'])
+            processed_sheets = {}  # To store processed data for each SIC code
             
             # Process each keyword
             progress_bar = st.progress(0)
@@ -101,6 +110,11 @@ def main():
                 if keyword_df is not None:
                     # Filter data
                     filtered_df = filter_and_append_data(keyword_df)
+                    
+                    # Store processed data for this SIC code
+                    processed_sheets[keyword] = filtered_df
+                    
+                    # Append to accumulated data
                     all_data = pd.concat([all_data, filtered_df], ignore_index=True)
                     
                     # Collect active company addresses
@@ -117,19 +131,28 @@ def main():
             # Create Excel file in memory
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                # Write individual sheets for each processed SIC code
+                for sic_code, df in processed_sheets.items():
+                    # Clean sheet name to be valid Excel sheet name
+                    sheet_name = str(sic_code)[:31]  # Excel sheet names max 31 chars
+                    sheet_name = ''.join(c for c in sheet_name if c.isalnum() or c in (' ', '_'))
+                    if not sheet_name:
+                        sheet_name = f"SIC_{hash(sic_code)}"[:31]
+                    
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    
+                    # Highlight dissolved companies in each sheet
+                    workbook = writer.book
+                    sheet = workbook[sheet_name]
+                    highlight_dissolved_rows(sheet, df.shape[1])
+                
+                # Write master data sheet
                 all_data.to_excel(writer, sheet_name='Master_Data', index=False)
+                highlight_dissolved_rows(writer.book['Master_Data'], all_data.shape[1])
+                
+                # Write stats and addresses sheets
                 pd.DataFrame.from_dict(stats, orient='index').to_excel(writer, sheet_name='Stats')
                 active_company_addresses.to_excel(writer, sheet_name='Active_Addresses', index=False)
-                
-                # Highlight dissolved companies
-                workbook = writer.book
-                data_sheet = workbook['Master_Data']
-                red_fill = PatternFill(start_color='FFCCCB', end_color='FFCCCB', fill_type='solid')
-                
-                for row in data_sheet.iter_rows(min_row=2, max_row=data_sheet.max_row, min_col=1, max_col=data_sheet.max_column):
-                    if row[data_sheet.max_column - 1].value == 'Dissolved':
-                        for cell in row:
-                            cell.fill = red_fill
             
             output.seek(0)
             
