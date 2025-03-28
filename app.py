@@ -8,14 +8,50 @@ import urllib.parse
 import openpyxl
 from openpyxl.styles import PatternFill
 import streamlit as st
+import re
 
-def read_keywords(file):
+def validate_sic_input(input_str):
+    """Validate manually entered SIC codes"""
+    if not input_str.strip():
+        return False, "Input cannot be empty"
+    
+    # Check for invalid characters (only numbers, commas, and spaces allowed)
+    if not re.match(r'^[\d\s,]+$', input_str):
+        return False, "Only numbers and commas are allowed"
+    
+    # Split and check individual codes
+    codes = [code.strip() for code in input_str.split(',') if code.strip()]
+    if not codes:
+        return False, "No valid SIC codes found"
+    
+    for code in codes:
+        if not code.isdigit():
+            return False, f"'{code}' is not a valid number"
+        if len(code) > 5:  # SIC codes are typically 4-5 digits
+            return False, f"'{code}' is too long (max 5 digits)"
+    
+    return True, codes
+
+def read_keywords_from_file(file):
     """Read keywords from uploaded file"""
     try:
         df = pd.read_csv(file)
         # Assuming keywords are in the first column
         keywords = df.iloc[:, 0].dropna().astype(str).str.strip().tolist()
-        return keywords
+        
+        # Validate the codes from file
+        valid_codes = []
+        invalid_codes = []
+        for code in keywords:
+            if code.isdigit() and len(code) <= 5:
+                valid_codes.append(code)
+            else:
+                invalid_codes.append(code)
+        
+        if invalid_codes:
+            st.warning(f"Found {len(invalid_codes)} invalid SIC codes in file (ignored): {', '.join(invalid_codes)}")
+        
+        return valid_codes
     except Exception as e:
         st.error(f"Error reading parameters file: {e}")
         return []
@@ -80,20 +116,38 @@ def highlight_dissolved_rows(sheet, max_col):
 
 def main():
     st.title("Company Data Processor")
-    st.write("Upload a CSV file containing SIC codes to search for companies.")
+    st.write("Search for companies by SIC codes. You can either upload a CSV file or enter codes manually.")
     
-    # File upload
-    uploaded_file = st.file_uploader("Upload Parameters CSV", type=['csv'])
+    # Input method selection
+    input_method = st.radio(
+        "Select input method:",
+        ("Upload CSV file", "Enter SIC codes manually"),
+        horizontal=True
+    )
     
-    if uploaded_file is not None:
+    keywords = []
+    
+    if input_method == "Upload CSV file":
+        uploaded_file = st.file_uploader("Upload CSV file with SIC codes (one per line or comma-separated)", type=['csv'])
+        if uploaded_file is not None:
+            keywords = read_keywords_from_file(uploaded_file)
+    else:
+        manual_input = st.text_area(
+            "Enter SIC codes (comma-separated):",
+            placeholder="e.g., 62012, 62020, 58210",
+            help="Enter 4-5 digit SIC codes separated by commas"
+        )
+        
+        if st.button("Validate and Process Codes"):
+            is_valid, result = validate_sic_input(manual_input)
+            if is_valid:
+                keywords = result
+                st.success(f"Validated {len(keywords)} SIC codes")
+            else:
+                st.error(f"Validation error: {result}")
+    
+    if keywords:
         with st.spinner('Processing...'):
-            # Read keywords
-            keywords = read_keywords(uploaded_file)
-            
-            if not keywords:
-                st.error("No valid keywords found in the uploaded file.")
-                return
-            
             # Accumulated data
             all_data = pd.DataFrame()
             active_company_addresses = pd.DataFrame(columns=['company_name', 'registered_office_address'])
@@ -121,71 +175,70 @@ def main():
                     active_addresses = filtered_df[filtered_df['company_status'] == 'Active'][['company_name', 'registered_office_address']]
                     active_company_addresses = pd.concat([active_company_addresses, active_addresses], ignore_index=True)
             
-            # Remove duplicates
-            all_data.drop_duplicates(inplace=True)
-            active_company_addresses.drop_duplicates(inplace=True)
-            
-            # Generate stats
-            stats = process_company_stats(all_data)
-            
-            # Create Excel file in memory
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                # Write individual sheets for each processed SIC code
-                for sic_code, df in processed_sheets.items():
-                    # Clean sheet name to be valid Excel sheet name
-                    sheet_name = str(sic_code)[:31]  # Excel sheet names max 31 chars
-                    sheet_name = ''.join(c for c in sheet_name if c.isalnum() or c in (' ', '_'))
-                    if not sheet_name:
-                        sheet_name = f"SIC_{hash(sic_code)}"[:31]
-                    
-                    df.to_excel(writer, sheet_name=sheet_name, index=False)
-                    
-                    # Highlight dissolved companies in each sheet
-                    workbook = writer.book
-                    sheet = workbook[sheet_name]
-                    highlight_dissolved_rows(sheet, df.shape[1])
+            if not all_data.empty:
+                # Remove duplicates
+                all_data.drop_duplicates(inplace=True)
+                active_company_addresses.drop_duplicates(inplace=True)
                 
-                # Write master data sheet
-                all_data.to_excel(writer, sheet_name='Master_Data', index=False)
-                highlight_dissolved_rows(writer.book['Master_Data'], all_data.shape[1])
+                # Generate stats
+                stats = process_company_stats(all_data)
                 
-                # Write stats and addresses sheets
-                pd.DataFrame.from_dict(stats, orient='index').to_excel(writer, sheet_name='Stats')
-                active_company_addresses.to_excel(writer, sheet_name='Active_Addresses', index=False)
-            
-            output.seek(0)
-            
-            # Show results
-            st.success("Processing complete!")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.download_button(
-                    label="Download Excel Report",
-                    data=output,
-                    file_name="Company_Data.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            
-            with col2:
-                st.download_button(
-                    label="Download Active Addresses (CSV)",
-                    data=active_company_addresses.to_csv(index=False).encode('utf-8'),
-                    file_name="Active_Addresses.csv",
-                    mime="text/csv"
-                )
-            
-            # Show previews
-            st.subheader("Preview of Master Data")
-            st.dataframe(all_data.head())
-            
-            st.subheader("Preview of Active Company Addresses")
-            st.dataframe(active_company_addresses.head())
-            
-            st.subheader("Statistics")
-            st.write(stats)
+                # Create Excel file in memory
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    # Write individual sheets for each processed SIC code
+                    for sic_code, df in processed_sheets.items():
+                        # Clean sheet name to be valid Excel sheet name
+                        sheet_name = f"SIC_{sic_code}"[:31]  # Excel sheet names max 31 chars
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        
+                        # Highlight dissolved companies in each sheet
+                        workbook = writer.book
+                        sheet = workbook[sheet_name]
+                        highlight_dissolved_rows(sheet, df.shape[1])
+                    
+                    # Write master data sheet
+                    all_data.to_excel(writer, sheet_name='Master_Data', index=False)
+                    highlight_dissolved_rows(writer.book['Master_Data'], all_data.shape[1])
+                    
+                    # Write stats and addresses sheets
+                    pd.DataFrame.from_dict(stats, orient='index').to_excel(writer, sheet_name='Stats')
+                    active_company_addresses.to_excel(writer, sheet_name='Active_Addresses', index=False)
+                
+                output.seek(0)
+                
+                # Show results
+                st.success("Processing complete!")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.download_button(
+                        label="Download Excel Report",
+                        data=output,
+                        file_name="Company_Data.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                
+                with col2:
+                    st.download_button(
+                        label="Download Active Addresses (CSV)",
+                        data=active_company_addresses.to_csv(index=False).encode('utf-8'),
+                        file_name="Active_Addresses.csv",
+                        mime="text/csv"
+                    )
+                
+                # Show previews
+                st.subheader("Preview of Master Data")
+                st.dataframe(all_data.head())
+                
+                st.subheader("Preview of Active Company Addresses")
+                st.dataframe(active_company_addresses.head())
+                
+                st.subheader("Statistics")
+                st.write(stats)
+            else:
+                st.warning("No valid company data found for the provided SIC codes")
 
 if __name__ == "__main__":
     main()
